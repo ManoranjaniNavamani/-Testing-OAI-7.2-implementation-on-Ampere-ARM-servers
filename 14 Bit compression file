@@ -1,0 +1,118 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+#include <armral.h>
+
+#define COMPRESSED_LENGTH 14
+#define NUM_RBS 8
+#define NUM_ELEMENTS (24 * NUM_RBS)
+#define ORIGIN 2048
+#define STEP 4
+#define ABS_CENTER 4096
+#define WIDTH 1024
+#define RAND_INIT
+
+int compress_bfp(int16_t *input, unsigned int num_elements, uint8_t *compressed, unsigned int *exponent) {
+    uint32_t max_val = abs(input[0]);
+    for (int i = 1; i < num_elements; i++) {
+        if (abs(input[i]) > max_val) {
+            max_val = abs(input[i]);
+        }
+    }
+
+    *exponent = 32 + 1 - COMPRESSED_LENGTH;
+    uint32_t mask = 0x80000000;
+    while ((max_val & mask) == 0 && *exponent > 0) {
+        *exponent -= 1;
+        mask >>= 1;
+    }
+
+    memset(compressed, 0, (num_elements * COMPRESSED_LENGTH) / 8 + 1);
+    for (int i = 0; i < num_elements; i++) {
+        uint16_t scaled_value = (uint16_t)input[i] >> *exponent;
+        uint32_t bit_offset = i * COMPRESSED_LENGTH;
+        uint32_t byte_offset = bit_offset / 8;
+        uint32_t bit_offset_in_byte = bit_offset % 8;
+
+        uint32_t value = scaled_value << bit_offset_in_byte;
+        compressed[byte_offset] |= (value & 0xFF);
+        compressed[byte_offset + 1] |= ((value >> 8) & 0xFF);
+        if (COMPRESSED_LENGTH + bit_offset_in_byte > 16)
+            compressed[byte_offset + 2] |= ((value >> 16) & 0xFF);
+    }
+    return num_elements;
+}
+
+int decompress_bfp(uint8_t *compressed, int num_elements, int16_t exponent, int16_t *decompressed) {
+    for (int i = 0; i < num_elements; i++) {
+        uint32_t bit_offset = i * COMPRESSED_LENGTH;
+        uint32_t byte_offset = bit_offset / 8;
+        uint32_t bit_offset_in_byte = bit_offset % 8;
+
+        uint32_t value = (compressed[byte_offset] |
+                         (compressed[byte_offset + 1] << 8) |
+                         (compressed[byte_offset + 2] << 16)) >> bit_offset_in_byte;
+
+        int16_t scaled_value = value & ((1 << COMPRESSED_LENGTH) - 1);
+        // Sign extend
+        if (scaled_value & (1 << (COMPRESSED_LENGTH - 1))) {
+            scaled_value |= ~((1 << COMPRESSED_LENGTH) - 1);
+        }
+
+        decompressed[i] = scaled_value << exponent;
+    }
+    return num_elements;
+}
+
+int main() {
+    int16_t input[NUM_ELEMENTS];
+    uint8_t compressed[(NUM_ELEMENTS * COMPRESSED_LENGTH) / 8 + 2]; // +2 for safety
+    memset(compressed, 0, sizeof(compressed));
+    int16_t decompressed[NUM_ELEMENTS];
+    unsigned int exponent[NUM_RBS];
+
+    armral_compressed_data_14bit armral_compressed[NUM_RBS];
+    int16_t armral_decompressed[NUM_ELEMENTS];
+
+    // Initialize input data
+    for (unsigned int i = 0; i < NUM_ELEMENTS; i++) {
+#ifdef RAND_INIT
+        int16_t tmp = ((rand() % (2 * WIDTH)) - WIDTH);
+        input[i] = (tmp >= 0) ? (tmp + ABS_CENTER - WIDTH / 2) : (tmp - ABS_CENTER + WIDTH / 2);
+#else
+        input[i] = ORIGIN + STEP * i;
+        input[i] = i % 2 ? input[i] : -input[i];
+#endif
+    }
+
+    printf("Naive Compression:\n");
+    for (int rb = 0; rb < NUM_RBS; rb++) {
+        int compressed_size = compress_bfp(&input[24 * rb], 24, &compressed[3 * 24 * rb], &exponent[rb]);
+        printf("RB#%d Compression successful. Exponent: %d. Compressed size: %d elements\n", rb, exponent[rb], compressed_size);
+    }
+
+    printf("ArmRAL Compression:\n");
+    armral_block_float_compr_14bit(NUM_RBS, (armral_cmplx_int16_t *)input, armral_compressed, NULL);
+    for (int rb = 0; rb < NUM_RBS; rb++) {
+        printf("RB#%d Compression successful. Exponent: %d\n", rb, armral_compressed[rb].exp);
+    }
+
+    printf("Naive Decompression:\n");
+    for (int rb = 0; rb < NUM_RBS; rb++) {
+        decompress_bfp(&compressed[3 * 24 * rb], 24, exponent[rb], &decompressed[24 * rb]);
+        printf("RB#%d Decompression successful. Decompressed size: 24 elements\n", rb);
+    }
+
+    printf("ArmRAL Decompression:\n");
+    armral_block_float_decompr_14bit(NUM_RBS, armral_compressed, (armral_cmplx_int16_t *)armral_decompressed, NULL);
+
+    printf("Verification of Compression-Decompression:\n");
+    for (int i = 0; i < 100; i++) {
+        printf("Original: %04x, Decompressed: %04x, ArmRAL Decompressed: %04x\n",
+               input[i], decompressed[i], armral_decompressed[i]);
+    }
+
+    return 0;
+}
